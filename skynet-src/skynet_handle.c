@@ -11,28 +11,29 @@
 #define DEFAULT_SLOT_SIZE 4
 #define MAX_SLOT_SIZE 0x40000000
 
+// 这个结构用于记录，服务对应的别名，当应用层为某个服务命名时，会写到这里来
 struct handle_name {
-	char * name;
-	uint32_t handle;
+	char * name;                   // 服务别名
+    uint32_t handle;               // 服务id
 };
 
 struct handle_storage {
-	struct rwlock lock;
-
-	uint32_t harbor;
-	uint32_t handle_index;
-	int slot_size;
-	struct skynet_context ** slot;
-	
-	int name_cap;
-	int name_count;
-	struct handle_name *name;
+	struct rwlock lock;            // 读写锁
+    
+    uint32_t harbor;               // harbor id
+    uint32_t handle_index;         // 创建下一个服务时，该服务的slot idx，一般会先判断该slot是否被占用，后面会详细讨论
+    int slot_size;                 // slot的大小，一定是2^n，初始值是4
+    struct skynet_context ** slot; // skynet_context list
+        
+    int name_cap;                  // 别名列表大小，大小为2^n
+    int name_count;                // 别名数量
+    struct handle_name *name;      // 别名列表
 };
 
 static struct handle_storage *H = NULL;
 
 uint32_t
-skynet_handle_register(struct skynet_context *ctx) {
+skynet_handle_register(struct skynet_context *ctx) { //注册一个服务 返回为这个服务分配的handle
 	struct handle_storage *s = H;
 
 	rwlock_wlock(&s->lock);
@@ -41,14 +42,14 @@ skynet_handle_register(struct skynet_context *ctx) {
 		int i;
 		uint32_t handle = s->handle_index;
 		for (i=0;i<s->slot_size;i++,handle++) {
-			if (handle > HANDLE_MASK) {
+			if (handle > HANDLE_MASK) { //handle 的高八位是留给harbor的 所以handle用来查找是靠剩下的24位
 				// 0 is reserved
 				handle = 1;
 			}
 			int hash = handle & (s->slot_size-1);
 			if (s->slot[hash] == NULL) {
 				s->slot[hash] = ctx;
-				s->handle_index = handle + 1;
+				s->handle_index = handle + 1; //下一次分配handle就从这个序号开始计算
 
 				rwlock_wunlock(&s->lock);
 
@@ -56,9 +57,11 @@ skynet_handle_register(struct skynet_context *ctx) {
 				return handle;
 			}
 		}
+		//下面这段代码是扩容
 		assert((s->slot_size*2 - 1) <= HANDLE_MASK);
 		struct skynet_context ** new_slot = skynet_malloc(s->slot_size * 2 * sizeof(struct skynet_context *));
 		memset(new_slot, 0, s->slot_size * 2 * sizeof(struct skynet_context *));
+		//把老槽位里面的服务数据转移到合适的新的槽位中
 		for (i=0;i<s->slot_size;i++) {
 			if (s->slot[i]) {
 				int hash = skynet_context_handle(s->slot[i]) & (s->slot_size * 2 - 1);

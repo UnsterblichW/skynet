@@ -154,12 +154,12 @@ main(int argc, char *argv[]) {
 	lua_close(L);
 
 	config.thread =  optint("thread",8);
-	config.module_path = optstring("cpath","./cservice/?.so");
+	config.module_path = optstring("cpath","./cservice/?.so"); // 动态链接库（模块）的路径
 	config.harbor = optint("harbor", 1);
-	config.bootstrap = optstring("bootstrap","snlua bootstrap");
-	config.daemon = optstring("daemon", NULL);
-	config.logger = optstring("logger", NULL);
-	config.logservice = optstring("logservice", "logger");
+	config.bootstrap = optstring("bootstrap","snlua bootstrap");//启动服务设置 snlua作为服务模块 bootstrap作为服务对应的lua文件
+	config.daemon = optstring("daemon", NULL);//后台运行配置
+	config.logger = optstring("logger", NULL);//保存日志的文件名字
+	config.logservice = optstring("logservice", "logger");//默认的日志模块是 logservice.c	
 	config.profile = optboolean("profile", 1);
 
 	skynet_start(&config);

@@ -49,11 +49,13 @@ logger_cb(struct skynet_context * context, void *ud, int type, int session, uint
 	struct logger * inst = ud;
 	switch (type) {
 	case PTYPE_SYSTEM:
+		// 打开一个新的日志文件
 		if (inst->filename) {
 			inst->handle = freopen(inst->filename, "a", inst->handle);
 		}
 		break;
 	case PTYPE_TEXT:
+		//如果指定了日志文件 则加上时间信息
 		if (inst->filename) {
 			char tmp[SIZETIMEFMT];
 			int csec = timestring(ud, tmp);
@@ -82,10 +84,10 @@ logger_init(struct logger * inst, struct skynet_context *ctx, const char * parm)
 		strcpy(inst->filename, parm);
 		inst->close = 1;
 	} else {
-		inst->handle = stdout;
+		inst->handle = stdout; //如果没有配置具体的日志文件，就直接把日志输出到 标准输出
 	}
 	if (inst->handle) {
-		skynet_callback(ctx, inst, logger_cb);
+		skynet_callback(ctx, inst, logger_cb); //
 		return 0;
 	}
 	return 1;

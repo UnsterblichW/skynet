@@ -150,6 +150,11 @@ thread_timer(void *p) {
 	return NULL;
 }
 
+// 整个worker线程的消费流程是：
+// a) worker线程每次，从global_mq中弹出一个次级消息队列，如果次级消息队列为空，则该worker线程投入睡眠，timer线程每隔2.5毫秒会唤醒一条睡眠中的worker线程，并重新尝试从全局消息队列中pop一个次级消息队列出来，当次级消息队列不为空时，进入下一步
+// b) 根据次级消息的handle，找出其所属的服务（一个skynet_context实例）指针，从次级消息队列中，pop出n条消息（受weight值影响），并且将其作为参数，传给skynet_context的cb函数，并调用它
+// c) 当完成callback函数调用时，就从global_mq中再pop一个次级消息队列中，供下一次使用，并将本次使用的次级消息队列push回global_mq的尾部
+// d) 返回第a步
 static void *
 thread_worker(void *p) {
 	struct worker_parm *wp = p;
@@ -191,7 +196,7 @@ start(int thread) {
 	m->m = skynet_malloc(thread * sizeof(struct skynet_monitor *));
 	int i;
 	for (i=0;i<thread;i++) {
-		m->m[i] = skynet_monitor_new();
+		m->m[i] = skynet_monitor_new();  // 每个线程都创建了一个监视它的监视器
 	}
 	if (pthread_mutex_init(&m->mutex, NULL)) {
 		fprintf(stderr, "Init mutex error");
@@ -276,7 +281,7 @@ skynet_start(struct skynet_config * config) {
 	skynet_socket_init();
 	skynet_profile_enable(config->profile);
 
-	struct skynet_context *ctx = skynet_context_new(config->logservice, config->logger);
+	struct skynet_context *ctx = skynet_context_new(config->logservice, config->logger);  //创建日志服务
 	if (ctx == NULL) {
 		fprintf(stderr, "Can't launch %s service\n", config->logservice);
 		exit(1);

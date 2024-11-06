@@ -40,21 +40,22 @@
 #endif
 
 struct skynet_context {
-	void * instance;
-	struct skynet_module * mod;
-	void * cb_ud;
-	skynet_cb cb;
-	struct message_queue *queue;
-	ATOM_POINTER logfile;
+	void * instance;				// 由指定module的create函数，创建的数据实例指针，同一类服务可能有多个实例，
+                                    // 因此每个服务都应该有自己的数据
+	struct skynet_module * mod;     // 引用服务module的指针，方便后面对create、init、signal和release函数进行调用
+    void * cb_ud;                   // 调用callback函数时，回传给callback的userdata，一般是instance指针
+    skynet_cb cb;                   // 服务的消息回调函数，一般在skynet_module的init函数里指定
+    struct message_queue *queue;    // 服务专属的次级消息队列指针
+	ATOM_POINTER logfile;			// 日志句柄
 	uint64_t cpu_cost;	// in microsec
 	uint64_t cpu_start;	// in microsec
-	char result[32];
-	uint32_t handle;
-	int session_id;
-	ATOM_INT ref;
+	char result[32];				// 操作skynet_context的返回值，会写到这里
+	uint32_t handle;				// 标识唯一context的服务id
+	int session_id;					// 在发出请求后，收到对方的返回消息时，通过session_id来匹配一个返回，对应哪个请求
+	ATOM_INT ref;					// 引用计数变量，当为0时，表示内存可以被释放
 	int message_count;
-	bool init;
-	bool endless;
+	bool init;						// 是否完成初始化
+	bool endless;					// 消息是否堵住
 	bool profile;
 
 	CHECKCALLING_DECL
@@ -75,6 +76,7 @@ skynet_context_total() {
 	return ATOM_LOAD(&G_NODE.total);
 }
 
+// 服务的总数+1
 static void
 context_inc() {
 	ATOM_FINC(&G_NODE.total);
@@ -121,6 +123,12 @@ drop_message(struct skynet_message *msg, void *ud) {
 	skynet_send(NULL, source, msg->source, PTYPE_ERROR, msg->session, NULL, 0);
 }
 
+// skynet_context_new函数的第一行就是通过名字获取模块.
+// 模块实际上就是一些函数集合在一起,用来专门实现某种功能的。我们要用到一个模块,一般是这样使用的。
+// 0 获取到这个模块 m
+// 1 拿出这个模块的实例化函数,首先实例化一个对象。比如 inst = m.create()就是创建了一个实例
+// 2 然后使用这个模块的函数处理这个实例化对象。比如 m.init(inst,param) m.xxx(inst,param) m.yyy(inst,param)
+// 3 用完后,就可以释放这个实例了 比如 m.relaase(inst)
 struct skynet_context * 
 skynet_context_new(const char * name, const char *param) {
 	struct skynet_module * mod = skynet_module_query(name);
@@ -150,9 +158,9 @@ skynet_context_new(const char * name, const char *param) {
 	ctx->message_count = 0;
 	ctx->profile = G_NODE.profile;
 	// Should set to 0 first to avoid skynet_handle_retireall get an uninitialized handle
-	ctx->handle = 0;	
-	ctx->handle = skynet_handle_register(ctx);
-	struct message_queue * queue = ctx->queue = skynet_mq_create(ctx->handle);
+	ctx->handle = 0;	//这里如果不设置为0的话 是一个随机值；如果注册没有返回之前，就启动了回收，回收会从ctx里面拿出handle，一个随机值的handle会出现错误 
+	ctx->handle = skynet_handle_register(ctx); // 每个服务分配一个唯一的handle
+	struct message_queue * queue = ctx->queue = skynet_mq_create(ctx->handle);  //每个服务创建一个私有的消息队列
 	// init function maybe use ctx->handle, so it must init at last
 	context_inc();
 
@@ -164,7 +172,7 @@ skynet_context_new(const char * name, const char *param) {
 		if (ret) {
 			ctx->init = true;
 		}
-		skynet_globalmq_push(queue);
+		skynet_globalmq_push(queue); //把当前这个服务的 私有消息队列 加入到 全局消息队列
 		if (ret) {
 			skynet_error(ret, "LAUNCH %s %s", name, param ? param : "");
 		}

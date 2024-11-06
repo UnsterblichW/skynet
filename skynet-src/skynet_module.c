@@ -13,10 +13,10 @@
 #define MAX_MODULE_TYPE 32
 
 struct modules {
-	int count;
-	struct spinlock lock;
-	const char * path;
-	struct skynet_module m[MAX_MODULE_TYPE];
+	int count;                  				// modules的数量
+    struct spinlock lock;       				// 自旋锁，避免多个线程同时向skynet_module写入数据，保证线程安全
+    const char * path;          				// 由skynet配置表中的cpath指定，一般包含./cservice/?.so路径
+    struct skynet_module m[MAX_MODULE_TYPE];  	// 存放服务模块的数组，最多32类
 };
 
 static struct modules * M = NULL;
@@ -103,20 +103,20 @@ struct skynet_module *
 skynet_module_query(const char * name) {
 	struct skynet_module * result = _query(name);
 	if (result)
-		return result;
+		return result;  // 之前已经获取过这个模块了，有缓存了，直接返回
 
 	SPIN_LOCK(M)
 
 	result = _query(name); // double check
 
-	if (result == NULL && M->count < MAX_MODULE_TYPE) {
-		int index = M->count;
-		void * dl = _try_open(M,name);
+	if (result == NULL && M->count < MAX_MODULE_TYPE) { // 这个模块是第一次被查询
+		int index = M->count; //M可以认为是一个模块的集合，里面保存着所有的模块 index是为新添加的模块分配的一个位置序号
+		void * dl = _try_open(M,name); //打开这个模块对应的so文件（打开动态库）
 		if (dl) {
-			M->m[index].name = name;
-			M->m[index].module = dl;
+			M->m[index].name = name;  //模块的名字
+			M->m[index].module = dl;  //保存这个模块对应的动态库 
 
-			if (open_sym(&M->m[index]) == 0) {
+			if (open_sym(&M->m[index]) == 0) {//用动态库里面的函数填充模块
 				M->m[index].name = skynet_strdup(name);
 				M->count ++;
 				result = &M->m[index];
@@ -138,6 +138,8 @@ skynet_module_instance_create(struct skynet_module *m) {
 	}
 }
 
+
+// 调用属于每个模块的实例化函数比如说 日志模块 调用 service-src/service_logger.c logger_init
 int
 skynet_module_instance_init(struct skynet_module *m, void * inst, struct skynet_context *ctx, const char * parm) {
 	return m->init(inst, ctx, parm);
