@@ -368,11 +368,18 @@ end
 
 local coroutine_pool = setmetatable({}, { __mode = "kv" })
 
+--为了进一步提高性能，skynet对协程做了缓存，也就是说，一个协程在使用完以后，并不是让他结束掉，
+--而是把上一次使用的dispatch函数清掉，并且挂起协程，放入一个协程池中，供下一次调用
 local function co_create(f)
 	local co = tremove(coroutine_pool)
-	if co == nil then
+	if co == nil then -- 协程池中，再也找不到可以用的协程时，将重新创建一个
 		co = coroutine_create(function(...)
+			-- 执行回调函数，创建协程时，并不会立即执行，
+			-- 只有调用coroutine.resume时，才会执行内部逻辑，这行代码，只有在首次创建时会被调用
 			f(...)
+
+			-- 回调函数执行完，协程本次调用的使命就完成了，但是为了实现复用，这里不能让协程退出，
+            -- 而是将upvalue回调函数f赋值为空，再放入协程缓存池中，并且挂起，以便下次使用
 			while true do
 				local session = session_coroutine_id[co]
 				if session and session ~= 0 then
@@ -689,6 +696,7 @@ function skynet.setenv(key, value)
 	c.command("SETENV",key .. " " ..value)
 end
 
+-- 向其它服务发送消息
 function skynet.send(addr, typename, ...)
 	local p = proto[typename]
 	return c.send(addr, p.id, 0 , p.pack(...))
@@ -722,6 +730,7 @@ local function yield_call(service, session)
 	return msg,sz
 end
 
+-- 同步发送消息 并阻塞等待回应	
 function skynet.call(addr, typename, ...)
 	local tag = session_coroutine_tracetag[running_thread]
 	if tag then
@@ -848,6 +857,7 @@ function skynet.wakeup(token)
 	end
 end
 
+-- 注册特定类型消息的处理函数
 function skynet.dispatch(typename, func)
 	local p = proto[typename]
 	if func then
@@ -988,6 +998,7 @@ function skynet.dispatch_message(...)
 	assert(succ, tostring(err))
 end
 
+-- 启动一个lua服务，name为lua脚本名字,返回服务地址
 function skynet.newservice(name, ...)
 	return skynet.call(".launcher", "lua" , "LAUNCH", "snlua", name, ...)
 end
@@ -1074,6 +1085,10 @@ function skynet.init_service(start)
 	end
 end
 
+--这个函数，首先lua服务注册了一个lua层的消息回调函数，
+--前面已经讨论过，一个c服务在消费次级消息队列的消息时，最终会调用callback函数，
+--而这里做的工作则是，通过这个c层的callback函数，再转调lua层消息回调函数skynet.dispatch_message
+--c层的函数，就是 lualib-src/lua-skynet.c   static int lcallback(lua_State *L)
 function skynet.start(start_func)
 	c.callback(skynet.dispatch_message)
 	init_thread = skynet.timeout(0, function()

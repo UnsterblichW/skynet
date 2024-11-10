@@ -87,16 +87,16 @@ struct socket_stat {
 };
 
 struct socket {
-	uintptr_t opaque;
-	struct wb_list high;
-	struct wb_list low;
-	int64_t wb_size;
+	uintptr_t opaque;       // 与本socket关联的服务地址，socket接收到的消息，最后将会传送到这个服务商
+    struct wb_list high;    // 高优先级发送队列
+    struct wb_list low;     // 低优先级发送队列
+	int64_t wb_size;		// 发送字节大小
 	struct socket_stat stat;
 	ATOM_ULONG sending;
-	int fd;
-	int id;
-	ATOM_INT type;
-	uint8_t protocol;
+    int fd;                 // socket文件描述符
+    int id;                 // 位于socket_server的slot列表中的位置
+	ATOM_INT type;          // epoll事件触发时，会根据type来选择处理事件的逻辑
+	uint8_t protocol;		// 使用的协议tcp or udp
 	bool reading;
 	bool writing;
 	bool closing;
@@ -115,17 +115,17 @@ struct socket {
 struct socket_server {
 	volatile uint64_t time;
 	int reserve_fd;	// for EMFILE
-	int recvctrl_fd;
-	int sendctrl_fd;
-	int checkctrl;
-	poll_fd event_fd;
-	ATOM_INT alloc_id;
-	int event_n;
-	int event_index;
+    int recvctrl_fd;        // 接收管道消息的文件描述
+    int sendctrl_fd;        // 发送管道消息的文件描述
+    int checkctrl;          // 判断是否有其他线程通过管道，向socket线程发送消息的标记变量
+	poll_fd event_fd;       // epoll实例id
+	ATOM_INT alloc_id;      // 已经分配的socket slot列表id
+    int event_n;            // 标记本次epoll事件的数量
+    int event_index;        // 下一个未处理的epoll事件索引
 	struct socket_object_interface soi;
-	struct event ev[MAX_EVENT];
-	struct socket slot[MAX_SOCKET];
-	char buffer[MAX_INFO];
+	struct event ev[MAX_EVENT]; // epoll事件列表
+	struct socket slot[MAX_SOCKET];  // socket 列表
+	char buffer[MAX_INFO];  // 地址信息转成字符串以后，存在这里
 	uint8_t udpbuffer[MAX_UDP_PACKAGE];
 	fd_set rfds;
 };

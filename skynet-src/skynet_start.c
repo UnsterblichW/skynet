@@ -237,6 +237,8 @@ start(int thread) {
 
 static void
 bootstrap(struct skynet_context * logger, const char * cmdline) {
+	// cmdline == "snlua bootstrap"
+	//一大圈操作就是为了格式化 name = "snlua"  args = "bootstrap"
 	int sz = strlen(cmdline);
 	char name[sz+1];
 	char args[sz+1];
@@ -251,6 +253,11 @@ bootstrap(struct skynet_context * logger, const char * cmdline) {
 	} else {
 		args[0] = '\0';
 	}
+
+	// 创建一个c服务
+	// 一个名叫snlua， 初始化参数为bootstrap的c服务
+	// 加载了一个叫snlua的动态库，并且调用了
+	// snlua_create，snlua_init等实例函数来创建一个snlua服务
 	struct skynet_context *ctx = skynet_context_new(name, args);
 	if (ctx == NULL) {
 		skynet_error(NULL, "Bootstrap error : %s\n", cmdline);

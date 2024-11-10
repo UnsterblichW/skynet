@@ -26,28 +26,35 @@ do
 			return m
 		end
 
+		-- 主线程加载方式
 		local co, main = coroutine.running()
 		if main then
 			return require(name)
 		end
 
+		-- 协程加载方式
 		local filename = package.searchpath(name, package.path)
 		if not filename then
 			return require(name)
 		end
 
+		-- 加载文件
 		local modfunc = loadfile(filename)
 		if not modfunc then
 			return require(name)
 		end
 
+		-- 查找是否有其他协程也在加载相同文件
 		local loading_queue = loading[name]
 		if loading_queue then
+			-- 有其他协程正在加载
 			assert(loading_queue.co ~= co, "circular dependency")
 			-- Module is in the init process (require the same mod at the same time in different coroutines) , waiting.
 			local skynet = require "skynet"
+			-- 记录一下当前协程，马上要把它挂起了，以后唤醒用
 			loading_queue[#loading_queue+1] = co
 			skynet.wait(co)
+			-- 唤醒后直接返回模块，其他协程没出错一定加载好了的
 			local m = loaded[name]
 			if m == nil then
 				error(string.format("require %s failed", name))

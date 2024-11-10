@@ -123,16 +123,18 @@ static int
 lcallback(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
 	int forward = lua_toboolean(L, 2);
-	luaL_checktype(L,1,LUA_TFUNCTION);
-	lua_settop(L,1);
+	luaL_checktype(L,1,LUA_TFUNCTION); //检查第一个参数是否为函数类型。如果不是，则抛出错误
+	lua_settop(L,1);//将栈的大小调整到 1，以确保只有回调函数保留在栈顶
+	//创建一个新的用户数据 callback_context，用于存储回调相关信息并在 Lua 和 C 中共享
 	struct callback_context * cb_ctx = (struct callback_context *)lua_newuserdatauv(L, sizeof(*cb_ctx), 2);
+	//创建一个新的 Lua 协程，将其作为 cb_ctx->L 的回调环境。使用协程使得回调可以被异步调用，不会阻塞主 Lua 线程
 	cb_ctx->L = lua_newthread(L);
-	lua_pushcfunction(cb_ctx->L, traceback);
-	lua_setiuservalue(L, -2, 1);
-	lua_getfield(L, LUA_REGISTRYINDEX, "callback_context");
-	lua_setiuservalue(L, -2, 2);
-	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");
-	lua_xmove(L, cb_ctx->L, 1);
+	lua_pushcfunction(cb_ctx->L, traceback);//将 traceback 函数（通常用于调试或捕获错误）压入协程栈。
+	lua_setiuservalue(L, -2, 1);//将 traceback 函数设置为 cb_ctx 用户数据的第一个用户值，用于回调时捕获错误信息
+	lua_getfield(L, LUA_REGISTRYINDEX, "callback_context");//从 Lua 注册表中获取 callback_context 表并将其压入栈顶
+	lua_setiuservalue(L, -2, 2);//将 callback_context 表设为 cb_ctx 用户数据的第二个用户值，以便在回调时可以快速访问和操作回调上下文
+	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");//将 callback_context 重新设置到注册表中，以便后续可以直接通过注册表访问到该环境表
+	lua_xmove(L, cb_ctx->L, 1);//将回调函数从主线程 L 移动到新创建的协程 cb_ctx->L 中。这样，回调函数可以在该协程中执行
 
 	skynet_callback(context, cb_ctx, (forward)?(_forward_pre):(_cb_pre));
 	return 0;

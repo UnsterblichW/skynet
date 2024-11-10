@@ -13,6 +13,7 @@ local function number_address(name)
 	end
 end
 
+-- 启动一个C服务，第一个参数为服务名字，后续为服务参数。返回服务地址
 function skynet.launch(...)
 	local addr = c.command("LAUNCH", table.concat({...}," "))
 	if addr then
@@ -56,6 +57,7 @@ function skynet.register(name)
 	end
 end
 
+-- 为服务地址映射一个全局名字	
 function skynet.name(name, handle)
 	if not globalname(name, handle) then
 		c.command("NAME", name .. " " .. skynet.address(handle))

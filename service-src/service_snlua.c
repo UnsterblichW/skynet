@@ -335,18 +335,24 @@ init_profile(lua_State *L) {
 		{ "wrap", luaB_cowrap },
 		{ NULL, NULL },
 	};
-	luaL_newlibtable(L,l);
-	lua_newtable(L);	// table thread->start time
+	luaL_newlibtable(L,l);  // 创建一张新的表，并预分配足够保存下数组 l 内容的空间（但不填充）。
+	lua_newtable(L);	// table thread->start time 创建一张空表，并将其压栈。 它等价于 lua_createtable(L, 0, 0) 
 	lua_newtable(L);	// table thread->total time
 
 	lua_newtable(L);	// weak table
 	lua_pushliteral(L, "kv");
 	lua_setfield(L, -2, "__mode");
 
+	// 将栈顶元素（弱引用表）复制一份，并将其再次压入栈顶。
+	// 将当前栈顶（弱引用表）设置为 start time 表的元表。
+    // 再次调用 lua_setmetatable(L, -3) 将弱引用表设置为 total time 表的元表。
+	// 通过给这两个表设置弱引用元表，可以使它们自动管理其数据的生命周期。
 	lua_pushvalue(L, -1);
-	lua_setmetatable(L, -3);
+	lua_setmetatable(L, -3); // 把一张表弹出栈，并将其设为给定索引处的值的元表。
 	lua_setmetatable(L, -3);
 
+	// 将数组 l 中的函数注册到栈顶表中（即模块表）。
+	// 2 表示附加的上值数量，也就是将 start time 和 total time 表作为这些函数的上值，使得这些函数可以直接访问这两个表。
 	luaL_setfuncs(L,l,2);
 
 	return 1;
@@ -380,6 +386,11 @@ optstring(struct skynet_context *ctx, const char *key, const char * str) {
 	return ret;
 }
 
+//c初始化lua_State，先是将服务指针，skynet_context保存起来，以方便lua层调c的时候使用，
+//然后就是一些配置设置，如设置lua服务脚本的存放路径，c服务so库的存放路径，lualib的存放路径等（加载和调用的时候，回到这些路径里找），
+//然后该lua_State会加载一个用于执行指定脚本的loader.lua脚本，
+//并将参数传给这个脚本（参数就是snlua服务绑定的lua脚本名称和传给这个脚本的参数拼起来的字符串，
+//比如要启动一个名为scene的服务，那么对应的脚本名称就是scene.lua）
 static int
 init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t sz) {
 	lua_State *L = l->L;
@@ -388,8 +399,11 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
 	lua_pushboolean(L, 1);  /* signal for libraries to ignore env. vars. */
 	lua_setfield(L, LUA_REGISTRYINDEX, "LUA_NOENV");
 	luaL_openlibs(L);
+	//加载一个名叫"skynet.profile"的模块，如果没有该模块则调用init_profile
+	//创建，并最后将该模块在LOADED["skynet.profile"] = module中保存起来
 	luaL_requiref(L, "skynet.profile", init_profile, 0);
 
+	//得到刚才的库，并将原本lua中的原本的函数替换成skynet自己的
 	int profile_lib = lua_gettop(L);
 	// replace coroutine.resume / coroutine.wrap
 	lua_getglobal(L, "coroutine");
@@ -400,6 +414,7 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
 
 	lua_settop(L, profile_lib-1);
 
+	//这里把上下文信息交给lua保存起来，用于之后lua调用c函数的时候作为参数
 	lua_pushlightuserdata(L, ctx);
 	lua_setfield(L, LUA_REGISTRYINDEX, "skynet_context");
 	luaL_requiref(L, "skynet.codecache", codecache , 0);
@@ -407,6 +422,7 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
 
 	lua_gc(L, LUA_GCGEN, 0, 0);
 
+	//这么多就是从main函数我们一开始创建的那个环境lua虚拟机中获取配置信息给对应lua服务的虚拟机
 	const char *path = optstring(ctx, "lua_path","./lualib/?.lua;./lualib/?/init.lua");
 	lua_pushstring(L, path);
 	lua_setglobal(L, "LUA_PATH");
@@ -425,12 +441,16 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
 
 	const char * loader = optstring(ctx, "lualoader", "./lualib/loader.lua");
 
+	//加载了一个loader.lua的文件
+	//luaL_loadfile不会执行文件里面的逻辑，而是把整个文件封装成了一个lua函数，返回栈
+	//由下面的lua_pcall调用
 	int r = luaL_loadfile(L,loader);
 	if (r != LUA_OK) {
 		skynet_error(ctx, "Can't load %s : %s", loader, lua_tostring(L, -1));
 		report_launcher_error(ctx);
 		return 1;
 	}
+	//传入参数“bootstrap” 并执行loader.lua里面的逻辑
 	lua_pushlstring(L, args, sz);
 	r = lua_pcall(L,1,0,1);
 	if (r != LUA_OK) {
@@ -466,6 +486,9 @@ launch_cb(struct skynet_context * context, void *ud, int type, int session, uint
 	return 0;
 }
 
+//这里将launch_cb作为该snlua服务的callback函数，
+//完成注册以后，向自己发送了一个消息，本snlua服务在接收到消息以后，就会调用launch_cb函数，
+//此时，snlua服务的回调函数会被赋空值，并进行一次snlua绑定的lua_State的初始化
 int
 snlua_init(struct snlua *l, struct skynet_context *ctx, const char * args) {
 	int sz = strlen(args);
