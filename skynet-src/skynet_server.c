@@ -500,7 +500,7 @@ cmd_launch(struct skynet_context * context, const char * param) {
 	if (inst == NULL) {
 		return NULL;
 	} else {
-		id_to_hex(context->result, inst->handle);
+		id_to_hex(context->result, inst->handle); //把handle表示成8位16进制的字符串 注意是以冒号开头举例":000123ff"
 		return context->result;
 	}
 }

@@ -210,6 +210,7 @@ skynet_timeout(uint32_t handle, int time, int session) {
 		message.data = NULL;
 		message.sz = (size_t)PTYPE_RESPONSE << MESSAGE_TYPE_SHIFT;
 
+		// 向handle对应的服务的消息队列中，推送一条消息
 		if (skynet_context_push(handle, &message)) {
 			return -1;
 		}

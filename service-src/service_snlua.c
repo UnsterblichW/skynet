@@ -24,13 +24,13 @@
 #define MEMORY_WARNING_REPORT (1024 * 1024 * 32)
 
 struct snlua {
-	lua_State * L;
-	struct skynet_context * ctx;
-	size_t mem;
-	size_t mem_report;
-	size_t mem_limit;
-	lua_State * activeL;
-	ATOM_INT trap;
+    lua_State *L; 				// 状态机
+    struct skynet_context *ctx; // 关联的 skynet context
+    size_t mem; 				// 已经使用的内存
+    size_t mem_report; 			// 触发内存警告的阈值
+    size_t mem_limit; 			// 内存的上限设置
+    lua_State *activeL; 		// 目前正在运行的状态机
+    ATOM_INT trap; 				// 打断状态
 };
 
 // LUA_CACHELIB may defined in patched lua for shared proto
@@ -450,7 +450,7 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
 		report_launcher_error(ctx);
 		return 1;
 	}
-	//传入参数“bootstrap” 并执行loader.lua里面的逻辑
+	//传入参数 bootstrap 并执行loader.lua里面的逻辑
 	lua_pushlstring(L, args, sz);
 	r = lua_pcall(L,1,0,1);
 	if (r != LUA_OK) {
@@ -477,7 +477,7 @@ static int
 launch_cb(struct skynet_context * context, void *ud, int type, int session, uint32_t source , const void * msg, size_t sz) {
 	assert(type == 0 && session == 0);
 	struct snlua *l = ud;
-	skynet_callback(context, NULL, NULL);
+	skynet_callback(context, NULL, NULL); // 取消设置了回调函数，也就是说snlua服务收到的第一个消息是由launch_cb来处理的，但后续的消息不是
 	int err = init_cb(l, context, msg, sz);
 	if (err) {
 		skynet_command(context, "EXIT", NULL);
@@ -492,9 +492,9 @@ launch_cb(struct skynet_context * context, void *ud, int type, int session, uint
 int
 snlua_init(struct snlua *l, struct skynet_context *ctx, const char * args) {
 	int sz = strlen(args);
-	char * tmp = skynet_malloc(sz);
+	char * tmp = skynet_malloc(sz);  // 分配一个内存块
 	memcpy(tmp, args, sz);
-	skynet_callback(ctx, l , launch_cb);
+	skynet_callback(ctx, l , launch_cb);  // 收到第一个消息之后，就会调用 launch_cb
 	const char * self = skynet_command(ctx, "REG", NULL);
 	uint32_t handle_id = strtoul(self+1, NULL, 16);
 	// it must be first message

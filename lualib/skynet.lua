@@ -16,9 +16,10 @@ local tunpack = table.unpack
 local traceback = debug.traceback
 
 local cresume = coroutine.resume
-local running_thread = nil
+local running_thread = nil  -- 当前正在运行的协程（一个Lua虚拟机中，只会有1个协程处在 正在运行状态）
 local init_thread = nil
 
+-- 唤醒 co 这个协程，然后会把 running_thread 置为 co
 local function coroutine_resume(co, ...)
 	running_thread = co
 	return cresume(co, ...)
@@ -44,10 +45,36 @@ local skynet = {
 	PTYPE_TRACE = 12,	-- use for debug trace
 }
 
--- code cache
+-- code cache , 在 service_snlua.c 中初始化
 skynet.cache = require "skynet.codecache"
 skynet._proto = proto
 
+--[[
+例如你可以注册一个以文本方式编码消息的消息类别。通常用 C 编写的服务更容易解析文本消息。
+skynet 已经定义了这种消息类别为 skynet.PTYPE_TEXT，但默认并没有注册到 lua 中使用。
+
+class = {
+  name = "text",
+  id = skynet.PTYPE_TEXT,
+  pack = function(m) return tostring(m) end,
+  unpack = skynet.tostring,
+  dispatch = dispatch,	-- 下面说到的 dispatch 函数.
+}
+
+新的类别必须提供 pack 和 unpack 函数，用于消息的编码和解码。
+
+pack 函数必须返回一个 string 或是一个 userdata 和 size。
+在 Lua 脚本中，推荐你返回 string 类型，而用后一种形式需要对 skynet 底层有足够的了解（采用它多半是因为性能考虑，可以减少一些数据拷贝）。
+
+unpack 函数接收一个 lightuserdata 和一个整数 。即上面提到的 message 和 size。
+lua 无法直接处理 C 指针，所以必须使用额外的 C 库导入函数来解码。skynet.tostring 就是这样的一个函数，它将这个 C 指针和长度翻译成 lua 的 string。
+
+接下来你可以使用 skynet.dispatch 注册 text 类别的处理方法了。当然，直接在 skynet.register_protocol 时传入 dispatch 函数也可以。
+--]]
+
+-- 在 skynet 中注册新的消息类别.
+-- @param class 里面的字段参考上面的注释
+-- @return nil
 function skynet.register_protocol(class)
 	local name = class.name
 	local id = class.id
@@ -57,18 +84,36 @@ function skynet.register_protocol(class)
 	proto[id] = class
 end
 
+-- session 和 coroutine 的映射关系表, 键是 session, 值是 coroutine
+-- 存在一种特殊情况, 当 wakeup 的时候, 存储的值是字符串 "BREAK"
+-- 这个表用于一般需要等待其他服务回应信息的情况, 因为当其他服务回应信息的时候, 可以通过返回的 session 找到 coroutine, 然后恢复 coroutine 的执行.
 local session_id_coroutine = {}
+
+-- coroutine 和 session 的映射关系表, 键是 coroutine, 值是 session
+-- 每次接收到非 response 类型消息的时候都会记录这个值.
 local session_coroutine_id = {}
+
+-- coroutine 和 address 的映射关系表, 键是 coroutine, 值是 address(整型)
+-- 每次接收到非 response 类型消息的时候都会记录这个值.
 local session_coroutine_address = {}
+
 local session_coroutine_tracetag = {}
-local unresponse = {}
 
-local wakeup_queue = {}
-local sleep_session = {}
+local unresponse = {}  -- 用来记录所有延迟的响应 在 "RESPONSE" 时, 存储还未发送响应数据的函数. 键是 response 函数, 值为 true
 
+local wakeup_queue = {} -- 记录需要唤醒的 coroutine, 键是 coroutine, 值是 true
+local sleep_session = {} -- 当前因 "SLEEP" 挂起的协程, 键是当前被阻塞的 coroutine, 值是 session
+
+-- 监控的 session, 键是 session, 值是服务地址(整型)
+-- 存储的 session 是需要回应的 session, 地址就是请求的服务器地址.
 local watching_session = {}
+
+-- 错误队列, 存放的是 session 的数组, 产生错误的 session 都放在此数组里面
 local error_queue = {}
-local fork_queue = { h = 1, t = 0 }
+
+-- 通过 skynet.fork() 创建的 coroutine 的集合
+-- h 表示 head， t 表示 tail 
+local fork_queue = { h = 1, t = 0 } 
 
 local auxsend, auxtimeout, auxwait
 do ---- avoid session rewind conflict
@@ -368,18 +413,19 @@ end
 
 local coroutine_pool = setmetatable({}, { __mode = "kv" })
 
---Ϊ�˽�һ��������ܣ�skynet��Э�����˻��棬Ҳ����˵��һ��Э����ʹ�����Ժ󣬲�����������������
---���ǰ���һ��ʹ�õ�dispatch������������ҹ���Э�̣�����һ��Э�̳��У�����һ�ε���
+--为了进一步提高性能，skynet对协程做了缓存，也就是说，一个协程在使用完以后，并不是让他结束掉，
+--而是把上一次使用的dispatch函数清掉，并且挂起协程，放入一个协程池中，供下一次调用
+--这个函数只是在创建协程、找到一个可用的协程，然后把任务函数 f 设置给这个协程来在未来执行，并没有直接执行任务函数f
 local function co_create(f)
 	local co = tremove(coroutine_pool)
-	if co == nil then -- Э�̳��У���Ҳ�Ҳ��������õ�Э��ʱ�������´���һ��
+	if co == nil then -- 协程池中，再也找不到可以用的协程时，将重新创建一个
 		co = coroutine_create(function(...)
-			-- ִ�лص�����������Э��ʱ������������ִ�У�
-			-- ֻ�е���coroutine.resumeʱ���Ż�ִ���ڲ��߼������д��룬ֻ�����״δ���ʱ�ᱻ����
+			-- 执行回调函数，创建协程时，并不会立即执行，
+			-- 只有调用 coroutine.resume 时，才会执行内部逻辑，这行代码，只有在首次创建时会被调用
 			f(...)
 
-			-- �ص�����ִ���꣬Э�̱��ε��õ�ʹ��������ˣ�����Ϊ��ʵ�ָ��ã����ﲻ����Э���˳���
-            -- ���ǽ�upvalue�ص�����f��ֵΪ�գ��ٷ���Э�̻�����У����ҹ����Ա��´�ʹ��
+			-- 回调函数执行完，协程本次调用的使命就完成了，但是为了实现复用，这里不能让协程退出，
+            -- 而是将upvalue回调函数f赋值为空，再放入协程缓存池中，并且挂起，以便下次使用
 			while true do
 				local session = session_coroutine_id[co]
 				if session and session ~= 0 then
@@ -402,25 +448,37 @@ local function co_create(f)
 				end
 
 				-- recycle co into pool
-				f = nil
+				f = nil  -- 上面调用f(...)的时候已经把任务处理完了，这里为了回收这个协程，所以需要把f置空
 				coroutine_pool[#coroutine_pool+1] = co
 				-- recv new main function f
-				f = coroutine_yield "SUSPEND"
-				f(coroutine_yield())
+				f = coroutine_yield "SUSPEND" -- 挂起当前协程，当协程再次被唤醒时，把传递进来的参数赋值给f
+				f(coroutine_yield()) -- 可用的协程接收了新的任务函数f后，继续挂起，等待未来的某个时刻被 resume 唤醒
+				-- 等到未来某个时刻被某个 resume 唤醒后， coroutine_yield() 会返回 resume 传经来的参数
+				-- 也就类似于变成了 f(...) ，于是便可以执行任务了
 			end
 		end)
 	else
+		-- 发现协程池中有可用的协程
 		-- pass the main function f to coroutine, and restore running thread
-		local running = running_thread
+		local running = running_thread -- 保存调用co_create所在的协程
+		-- 给这个从协程池中取出来的协程，重新设置新的任务函数，
+		-- 也就是将会走到上面的分支 f = coroutine_yield "SUSPEND" 中
+		-- 等号左边的 f 将会因协程被唤醒，而接收下面这句 coroutine_resume(co, f) 传入的新的f
 		coroutine_resume(co, f)
-		running_thread = running
+		running_thread = running -- 已经给任务函数f找到了一个协程了，回到了调用co_create的所在的协程，这里需要重新恢复running_thread的值
 	end
 	return co
 end
 
+-- dispatch_wakeup主要的处理过程是这样:
+-- 1.如果唤醒队列中有协程，转2; 如果没有转4
+-- 2.取出一个，并唤醒执行。
+-- 3.唤醒执行挂起后回到1
+-- 4.dispatch_error_queue
+-- 总而言之，会把 wakeup_queue 和 error_queue 里面的协程都取完之后才真正走完流程
 local function dispatch_wakeup()
 	while true do
-		local token = tremove(wakeup_queue,1)
+		local token = tremove(wakeup_queue,1) --从唤醒队列中不断取出协程
 		if token then
 			local session = sleep_session[token]
 			if session then
@@ -458,7 +516,7 @@ function suspend(co, result, command)
 		coroutine.close(co)
 		error(tb)
 	end
-	if command == "SUSPEND" then
+	if command == "SUSPEND" then  -- suspend这个函数一般是走到这里分支
 		return dispatch_wakeup()
 	elseif command == "QUIT" then
 		coroutine.close(co)
@@ -500,8 +558,11 @@ end
 
 skynet.trace_timeout(false)	-- turn off by default
 
+-- 实际上是请求定时器线程往自己的队列添加一个消息。
+-- 首先会向系统注册一个定时器，然后获取一个协程。
+-- 当定时器触发时，通过定时器的session找到对应的协程，并执行这个协程。
 function skynet.timeout(ti, func)
-	local session = auxtimeout(ti)
+	local session = auxtimeout(ti) -- 会调用 skynet-src/skynet_server.c c层的函数 cmd_timeout
 	assert(session)
 	local co = co_create_for_timeout(func, ti)
 	assert(session_id_coroutine[session] == nil)
@@ -696,7 +757,7 @@ function skynet.setenv(key, value)
 	c.command("SETENV",key .. " " ..value)
 end
 
--- ��������������Ϣ
+-- 向其它服务发送消息
 function skynet.send(addr, typename, ...)
 	local p = proto[typename]
 	return c.send(addr, p.id, 0 , p.pack(...))
@@ -730,7 +791,7 @@ local function yield_call(service, session)
 	return msg,sz
 end
 
--- ͬ��������Ϣ �������ȴ���Ӧ	
+-- 同步发送消息 并阻塞等待回应	
 function skynet.call(addr, typename, ...)
 	local tag = session_coroutine_tracetag[running_thread]
 	if tag then
@@ -804,6 +865,7 @@ function skynet.ignoreret()
 	session_coroutine_id[running_thread] = nil
 end
 
+-- 包装一个延迟响应
 function skynet.response(pack)
 	pack = pack or skynet.pack
 
@@ -857,7 +919,7 @@ function skynet.wakeup(token)
 	end
 end
 
--- ע���ض�������Ϣ�Ĵ�������
+-- 注册特定类型消息的处理函数
 function skynet.dispatch(typename, func)
 	local p = proto[typename]
 	if func then
@@ -891,6 +953,9 @@ function skynet.dispatch_unknown_response(unknown)
 	return prev
 end
 
+-- 从功能上，它等价于 skynet.timeout(0, function() func(...) end) 但是比 timeout 高效一点。因为它并不需要向框架注册一个定时器。
+-- 这里有个小细节, 每次只有在接收到消息的时候才能执行 lua 代码, 而自定义的逻辑处理在 skynet.dispatch 时注册, 
+-- 所以我们自己的代码只有在 skynet.dispatch 注册的函数内才会运行, 而在 dispatch 的代码执行结束后, 才会执行 fork 的相关代码, 不必担心 fork 协程会无法启动.
 function skynet.fork(func,...)
 	local n = select("#", ...)
 	local co
@@ -908,29 +973,49 @@ end
 
 local trace_source = {}
 
+
+-- 每个 skynet 服务，最重要的职责就是处理别的服务发送过来的消息，以及向别的服务发送消息。每条 skynet 消息由五个元素构成。
+-- session ：大部分消息工作在请求回应模式下。即，一个服务向另一个服务发起一个请求，而后收到请求的服务在处理完请求消息后，回复一条消息。
+-- 			 session 是由发起请求的服务生成的，对它自己唯一的消息标识。回应方在回应时，将 session 带回。这样发送方才能识别出哪条消息是针对哪条的回应。
+--			 session 是一个非负整数，当一条消息不需要回应时，按惯例，使用 0 这个特殊的 session 号。session 由 skynet 框架生成管理，通常不需要使用者关心。
+-- source ：消息源。每个服务都由一个 32bit 整数标识。这个整数可以看成是服务在 skynet 系统中的地址。
+--			即使在服务退出后，新启动的服务通常也不会使用已用过的地址（除非发生回绕，但一般间隔时间非常长）。
+--			每条收到的消息都携带有 source ，方便在回应的时候可以指定地址。但地址的管理通常由框架完成，用户不用关心。
+-- type ：消息类别。每个服务可以接收 256 种不同类别的消息。每种类别可以有不同的消息编码格式。
+--		  有十几种类别是框架保留的，通常也不建议用户定义新的消息类别。因为用户完全可以利用已有的类别，而用具体的消息内容来区分每条具体的含义。框架把这些 type 映射为字符串便于记忆。
+--		  最常用的消息类别名为 "lua" 广泛用于用 lua 编写的 skynet 服务间的通讯。
+-- message ：消息的 C 指针，在 Lua 层看来是一个 lightuserdata 。框架会隐藏这个细节，最终用户处理的是经过解码过的 lua 对象。只有极少情况，你才需要在 lua 层直接操作这个指针。
+-- size ：消息的长度。通常和 message 一起结合起来使用。
+
+-- 对于每个消息(非 response 类型)都会创建 1 协程, 用来专门的处理消息;
+-- 对于 response 类型的消息, 会通过之前记录的 session 找到之前创建的协程, 然后恢复该协程的运行.
 local function raw_dispatch_message(prototype, msg, sz, session, source)
 	-- skynet.PTYPE_RESPONSE = 1, read skynet.h
-	if prototype == 1 then
+	if prototype == 1 then  --处理响应请求 别的服务响应当前服务
 		local co = session_id_coroutine[session]
-		if co == "BREAK" then
+		if co == "BREAK" then -- 已经被强制 wakeup
 			session_id_coroutine[session] = nil
-		elseif co == nil then
+		elseif co == nil then -- 无效的响应类型
 			unknown_response(session, source, msg, sz)
 		else
 			local tag = session_coroutine_tracetag[co]
 			if tag then c.trace(tag, "resume") end
 			session_id_coroutine[session] = nil
+			-- 开始或者继续挂起的协程(请求), 既然这里处理的是响应信息, 那么就可以理解为, 之前此服务的请求挂起了. 
+			-- 使用计时器来举例: 这时才会运行之前注册的计时器处理函数, 这也就是为什么 "而 func 将来会在新的 coroutine 中执行" 的意思.
+			-- 其实对于每个接收到的消息, 都会创建 1 个 coroutine 来处理.
 			suspend(co, coroutine_resume(co, true, msg, sz, session))
 		end
 	else
+		-- prototype 最常用的是 PTYPE_LUA
 		local p = proto[prototype]
-		if p == nil then
+		if p == nil then -- 如果没有注册该类型
 			if prototype == skynet.PTYPE_TRACE then
 				-- trace next request
 				trace_source[source] = c.tostring(msg,sz)
-			elseif session ~= 0 then
+			elseif session ~= 0 then -- 如果需要回应, 则告诉请求服务发生错误
 				c.send(source, skynet.PTYPE_ERROR, session, "")
-			else
+			else -- 如果不需要回应, 当前服务报告未知的请求类型
 				unknown_request(session, source, msg, sz, prototype)
 			end
 			return
@@ -938,9 +1023,9 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 
 		local f = p.dispatch
 		if f then
-			local co = co_create(f)
-			session_coroutine_id[co] = session
-			session_coroutine_address[co] = source
+			local co = co_create(f) -- 创建协程用来处理这次服务消息
+			session_coroutine_id[co] = session -- 保存session以便找到回去的路，注意这里的session是其他服务独立产生的，所以不同的请求者，发来的session可以是相同的
+			session_coroutine_address[co] = source -- 记录下当前的请求者是谁
 			local traceflag = p.trace
 			if traceflag == false then
 				-- force off
@@ -958,8 +1043,11 @@ local function raw_dispatch_message(prototype, msg, sz, session, source)
 					skynet.trace()
 				end
 			end
+			-- 开始处理消息, f(session, source, p.unpack(msg, sz, ...))
+			-- 开启 1 个新的协程去处理消息, 这样就不会导致当前接收消息这个主线程被阻塞
 			suspend(co, coroutine_resume(co, session,source, p.unpack(msg,sz)))
 		else
+			-- 无效的请求
 			trace_source[source] = nil
 			if session ~= 0 then
 				c.send(source, skynet.PTYPE_ERROR, session, "")
@@ -998,11 +1086,19 @@ function skynet.dispatch_message(...)
 	assert(succ, tostring(err))
 end
 
--- ����һ��lua����nameΪlua�ű�����,���ط����ַ
+-- 启动一个lua服务，name为lua脚本名字,返回服务地址
+-- 只有被启动的脚本的 start 函数返回后，这个 API 才会返回启动的服务的地址，这是一个阻塞 API 。
+-- 如果被启动的脚本在初始化环节抛出异常，或在初始化完成前就调用 skynet.exit 退出，｀skynet.newservice` 都会抛出异常。
+-- 如果被启动的脚本的 start 函数是一个永不结束的循环，那么 newservice 也会被永远阻塞住。
 function skynet.newservice(name, ...)
 	return skynet.call(".launcher", "lua" , "LAUNCH", "snlua", name, ...)
 end
 
+-- skynet.uniqueservice 和 skynet.newservice 的输入参数相同，都可以以一个脚本名称找到一段 lua 脚本并启动它，返回这个服务的地址。
+-- 但和 newservice 不同，每个名字的脚本在同一个 skynet 节点只会启动一次。如果已有同名服务启动或启动中，后调用的人获得的是前一次启动的服务的地址。
+-- 默认情况下，uniqueservice 是不跨节点的。也就是说，不同节点上调用 uniqueservice 即使服务脚本名相同，服务也会独立启动起来。
+-- 如果你需要整个网络有唯一的服务，那么可以在调用 uniqueservice 的参数前加一个 true ，表示这是一个全局服务。
+-- uniqueservice 采用的是惰性初始化的策略。整个系统中第一次调用时，服务才会被启动起来。
 function skynet.uniqueservice(global, ...)
 	if global == true then
 		return assert(skynet.call(".service", "lua", "GLAUNCH", ...))
@@ -1011,6 +1107,9 @@ function skynet.uniqueservice(global, ...)
 	end
 end
 
+-- 来查询已有服务。如果这个服务不存在，这个 api 会一直阻塞到它启动好为止。
+-- 对应的，查询服务 queryservice 也支持第一个参数为 true 的情况。
+-- 这种全局服务，queryservice 更加有用。往往你需要明确知道一个全局服务部署在哪个节点上，以便于合理的架构。
 function skynet.queryservice(global, ...)
 	if global == true then
 		return assert(skynet.call(".service", "lua", "GQUERY", ...))
@@ -1019,6 +1118,7 @@ function skynet.queryservice(global, ...)
 	end
 end
 
+--  用于把一个地址数字转换为一个可用于阅读的字符串。
 function skynet.address(addr)
 	if type(addr) == "number" then
 		return string.format(":%08x",addr)
@@ -1027,6 +1127,7 @@ function skynet.address(addr)
 	end
 end
 
+-- 用于获得服务所属的节点。
 function skynet.harbor(addr)
 	return c.harbor(addr)
 end
@@ -1081,16 +1182,18 @@ function skynet.init_service(start)
 		skynet.send(".launcher","lua", "ERROR")
 		skynet.exit()
 	else
-		skynet.send(".launcher","lua", "LAUNCHOK")
+		skynet.send(".launcher","lua", "LAUNCHOK") --任何服务完成start后，都会发送 LAUNCHOK 消息 给到 launcher 服务
 	end
 end
 
---�������������lua����ע����һ��lua�����Ϣ�ص�������
---ǰ���Ѿ����۹���һ��c���������Ѵμ���Ϣ���е���Ϣʱ�����ջ����callback������
---���������Ĺ������ǣ�ͨ�����c���callback��������ת��lua����Ϣ�ص�����skynet.dispatch_message
---c��ĺ��������� lualib-src/lua-skynet.c   static int lcallback(lua_State *L)
+--这个函数，首先lua服务注册了一个lua层的消息回调函数，
+--前面已经讨论过，一个c服务在消费次级消息队列的消息时，最终会调用callback函数，
+--而这里做的工作则是，通过这个c层的callback函数，再转调lua层消息回调函数skynet.dispatch_message
+
+-- 注册一个函数为这个服务的启动函数。当然你还是可以在脚本中随意写一个 Lua 代码，它们会先于 start 函数执行。
+-- 但是，不要在外面调用 skynet 的阻塞 API ，因为框架将无法唤醒它们。
 function skynet.start(start_func)
-	c.callback(skynet.dispatch_message)
+	c.callback(skynet.dispatch_message) --c层的函数，就是 lualib-src/lua-skynet.c   static int lcallback(lua_State *L)
 	init_thread = skynet.timeout(0, function()
 		skynet.init_service(start_func)
 		init_thread = nil

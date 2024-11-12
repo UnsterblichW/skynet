@@ -64,8 +64,8 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t 
 	lua_pushinteger(L, session);
 	lua_pushinteger(L, source);
 
-	r = lua_pcall(L, 5, 0 , trace);
-
+	r = lua_pcall(L, 5, 0 , trace); //调用lua层的skynet.dispatch_message，入参是上面5个值
+ 
 	if (r == LUA_OK) {
 		return 0;
 	}
@@ -121,6 +121,8 @@ _forward_pre(struct skynet_context *context, void *ud, int type, int session, ui
 
 static int
 lcallback(lua_State *L) {
+	//获取闭包的第一个上值，并将其转换为 skynet_context 结构体的指针 context，
+	//这里拿出来的上值，就是 luaopen_skynet_core 里面在注册一堆函数的时候设置的
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
 	int forward = lua_toboolean(L, 2);
 	luaL_checktype(L,1,LUA_TFUNCTION); //检查第一个参数是否为函数类型。如果不是，则抛出错误
@@ -136,6 +138,7 @@ lcallback(lua_State *L) {
 	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");//将 callback_context 重新设置到注册表中，以便后续可以直接通过注册表访问到该环境表
 	lua_xmove(L, cb_ctx->L, 1);//将回调函数从主线程 L 移动到新创建的协程 cb_ctx->L 中。这样，回调函数可以在该协程中执行
 
+	// 在function skynet.start(start_func)中 lua服务注册回调函数 在回调函数中调用lua层的消息分发函数 skynet.dispatch_message
 	skynet_callback(context, cb_ctx, (forward)?(_forward_pre):(_cb_pre));
 	return 0;
 }
@@ -524,18 +527,18 @@ luaopen_skynet_core(lua_State *L) {
 		{ NULL, NULL },
 	};
 
+	// 给lua创建一个表 x
 	lua_createtable(L, 0, sizeof(l)/sizeof(l[0]) + sizeof(l2)/sizeof(l2[0]) -2);
 
 	lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
-	struct skynet_context *ctx = lua_touserdata(L,-1);
+	struct skynet_context *ctx = lua_touserdata(L,-1); // 从注册表中拿到上值 ctx
 	if (ctx == NULL) {
 		return luaL_error(L, "Init skynet context first");
 	}
 
+	luaL_setfuncs(L,l,1); // 把 l 中的函数填充到表x里面，并且共享上值 ctx
 
-	luaL_setfuncs(L,l,1);
-
-	luaL_setfuncs(L,l2,0);
+	luaL_setfuncs(L,l2,0); // 把 l2 中的函数填充到表x里面，这些函数没有共享上值
 
 	return 1;
 }

@@ -13,9 +13,9 @@ local function number_address(name)
 	end
 end
 
--- Æô¶¯Ò»¸öC·şÎñ£¬µÚÒ»¸ö²ÎÊıÎª·şÎñÃû×Ö£¬ºóĞøÎª·şÎñ²ÎÊı¡£·µ»Ø·şÎñµØÖ·
+-- å¯åŠ¨ä¸€ä¸ªCæœåŠ¡ï¼Œç¬¬ä¸€ä¸ªå‚æ•°ä¸ºæœåŠ¡åå­—ï¼Œåç»­ä¸ºæœåŠ¡å‚æ•°ã€‚è¿”å›æœåŠ¡åœ°å€
 function skynet.launch(...)
-	local addr = c.command("LAUNCH", table.concat({...}," "))
+	local addr = c.command("LAUNCH", table.concat({...}," ")) -- æœ€åä¼šèµ°åˆ° cmd_launch å‡½æ•°é‡Œé¢å»
 	if addr then
 		return tonumber(string.sub(addr , 2), 16)
 	end
@@ -57,7 +57,7 @@ function skynet.register(name)
 	end
 end
 
--- Îª·şÎñµØÖ·Ó³ÉäÒ»¸öÈ«¾ÖÃû×Ö	
+-- ä¸ºæœåŠ¡åœ°å€æ˜ å°„ä¸€ä¸ªå…¨å±€åå­—	
 function skynet.name(name, handle)
 	if not globalname(name, handle) then
 		c.command("NAME", name .. " " .. skynet.address(handle))

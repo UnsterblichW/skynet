@@ -26,35 +26,35 @@ do
 			return m
 		end
 
-		-- Ö÷Ïß³Ì¼ÓÔØ·½Ê½
+		-- ä¸»çº¿ç¨‹åŠ è½½æ–¹å¼
 		local co, main = coroutine.running()
 		if main then
 			return require(name)
 		end
 
-		-- Ğ­³Ì¼ÓÔØ·½Ê½
+		-- åç¨‹åŠ è½½æ–¹å¼
 		local filename = package.searchpath(name, package.path)
 		if not filename then
 			return require(name)
 		end
 
-		-- ¼ÓÔØÎÄ¼ş
+		-- åŠ è½½æ–‡ä»¶
 		local modfunc = loadfile(filename)
 		if not modfunc then
 			return require(name)
 		end
 
-		-- ²éÕÒÊÇ·ñÓĞÆäËûĞ­³ÌÒ²ÔÚ¼ÓÔØÏàÍ¬ÎÄ¼ş
+		-- æŸ¥æ‰¾æ˜¯å¦æœ‰å…¶ä»–åç¨‹ä¹Ÿåœ¨åŠ è½½ç›¸åŒæ–‡ä»¶
 		local loading_queue = loading[name]
 		if loading_queue then
-			-- ÓĞÆäËûĞ­³ÌÕıÔÚ¼ÓÔØ
+			-- æœ‰å…¶ä»–åç¨‹æ­£åœ¨åŠ è½½
 			assert(loading_queue.co ~= co, "circular dependency")
 			-- Module is in the init process (require the same mod at the same time in different coroutines) , waiting.
 			local skynet = require "skynet"
-			-- ¼ÇÂ¼Ò»ÏÂµ±Ç°Ğ­³Ì£¬ÂíÉÏÒª°ÑËü¹ÒÆğÁË£¬ÒÔºó»½ĞÑÓÃ
+			-- è®°å½•ä¸€ä¸‹å½“å‰åç¨‹ï¼Œé©¬ä¸Šè¦æŠŠå®ƒæŒ‚èµ·äº†ï¼Œä»¥åå”¤é†’ç”¨
 			loading_queue[#loading_queue+1] = co
 			skynet.wait(co)
-			-- »½ĞÑºóÖ±½Ó·µ»ØÄ£¿é£¬ÆäËûĞ­³ÌÃ»³ö´íÒ»¶¨¼ÓÔØºÃÁËµÄ
+			-- å”¤é†’åç›´æ¥è¿”å›æ¨¡å—ï¼Œå…¶ä»–åç¨‹æ²¡å‡ºé”™ä¸€å®šåŠ è½½å¥½äº†çš„
 			local m = loaded[name]
 			if m == nil then
 				error(string.format("require %s failed", name))
