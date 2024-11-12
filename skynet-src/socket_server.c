@@ -17,11 +17,32 @@
 #include <assert.h>
 #include <string.h>
 
-#define MAX_INFO 128
+#define MAX_INFO 128			// socker_server 存储一些信息数据分配的内存空间
 // MAX_SOCKET will be 2^MAX_SOCKET_P
-#define MAX_SOCKET_P 16
-#define MAX_EVENT 64
-#define MIN_READ_BUFFER 64
+#define MAX_SOCKET_P 16			// 决定能够管理的 socket 数量, 直接控制当前 skynet 节点能够操作的 socket 数量
+#define MAX_EVENT 64			// 每次从 event pool 中读取 event 的最大数量
+#define MIN_READ_BUFFER 64		// 初始化 socket 读取数据的最小字节数
+
+// socket 的状态
+/*
+状态切换的分析:
+
+- invalid 状态的才能被 reserve;
+
+- 处于 invalid 状态的 socket 基本不能做任何的操作, 除了等着被 reserve;
+
+- 在创建侦听 socket 的时候, 状态变为 plisten, 通过调用 start_socket 方法状态改变为 listen, 这时才能获得连接的客户端;
+
+- 在接收到新的客户端连接时, 连接的客户端 socket 状态首先是 paccept, 通过调用 start_socket 方法状态改变为 connected, 这时才能接收/发送数据;
+
+- 在与其他主机连接的时候, 如果直接连接成功则状态直接设置为 connected, 否则设置为 connecting, 侦听事件通知, 如果对应的 socket 有读/写事件, 那么马上设置状态为 connected
+
+- 如果不是主动关闭 socket, 例如是客户端关闭 socket, 那么这时 socket 的状态是 invalid; 如果是主动关闭 socket, 
+那么会首先将状态设置为 halfclose, 这个状态会保证先将数据全部发送出去再关闭, 但是在这个状态的 socket 将忽略掉接收的数据, 
+也不再发送 close 之后的数据, 只是保证把 close 之前的数据发送出去.
+
+- bind 状态比较特殊, 使用 bind_socket(socket_server_bind) 直接设置状态为 bind 状态
+*/
 #define SOCKET_TYPE_INVALID 0
 #define SOCKET_TYPE_RESERVE 1
 #define SOCKET_TYPE_PLISTEN 2
@@ -33,22 +54,23 @@
 #define SOCKET_TYPE_PACCEPT 8
 #define SOCKET_TYPE_BIND 9
 
-#define MAX_SOCKET (1<<MAX_SOCKET_P)
+#define MAX_SOCKET (1<<MAX_SOCKET_P) // 最大的 socket 连接数
 
+// 数据发送优先级
 #define PRIORITY_HIGH 0
 #define PRIORITY_LOW 1
 
-#define HASH_ID(id) (((unsigned)id) % MAX_SOCKET)
+#define HASH_ID(id) (((unsigned)id) % MAX_SOCKET) // id 和 MAX_SOCKET 做 hash 运算
 #define ID_TAG16(id) ((id>>MAX_SOCKET_P) & 0xffff)
 
-#define PROTOCOL_TCP 0
-#define PROTOCOL_UDP 1
-#define PROTOCOL_UDPv6 2
+#define PROTOCOL_TCP 0		// tcp 协议, ipv4
+#define PROTOCOL_UDP 1		// udp 协议, ipv4
+#define PROTOCOL_UDPv6 2	// udp 协议, ipv6
 #define PROTOCOL_UNKNOWN 255
 
-#define UDP_ADDRESS_SIZE 19	// ipv6 128bit + port 16bit + 1 byte type
+#define UDP_ADDRESS_SIZE 19	// ipv6 128bit + port 16bit + 1 byte type, udp 地址信息分配内存空间
 
-#define MAX_UDP_PACKAGE 65535
+#define MAX_UDP_PACKAGE 65535	// udp 数据包的大小
 
 // EAGAIN and EWOULDBLOCK may be not the same value.
 #if (EAGAIN != EWOULDBLOCK)
@@ -61,19 +83,22 @@
 
 #define USEROBJECT ((size_t)(-1))
 
+// 写数据的缓存, 这是一个链表
 struct write_buffer {
-	struct write_buffer * next;
-	const void *buffer;
-	char *ptr;
-	size_t sz;
-	bool userobject;
+	struct write_buffer * next;		// 关联的下一个 write_buffer
+	const void *buffer;				// 数据的起始地址
+	char *ptr;						// 剩余发送数据的起始地址, 这里有个小细节, ptr 是 char * 类型, 指针每次的变化是 1 个字节. 可以参考 send_list_tcp 函数
+	size_t sz;						// 剩余发送数据的大小
+	bool userobject;				// 判断 buffer 是否是用户对象, 用户对象的内存控制由 socker_server 的 (soi)socket_object_interface 来决定
 };
 
+// udp 地址信息, 0 字节存储协议类型; 1, 2 字节存储端口号; 剩下的是地址数据, 对于 IPv4 使用 4 个字节存储, 对于 IPv6 使用 16 个字节存储;
 struct write_buffer_udp {
 	struct write_buffer buffer;
 	uint8_t udp_address[UDP_ADDRESS_SIZE];
 };
 
+// 写数据的链表数据结构
 struct wb_list {
 	struct write_buffer * head;
 	struct write_buffer * tail;
@@ -103,8 +128,8 @@ struct socket {
 	ATOM_INT udpconnecting;
 	int64_t warn_size;
 	union {
-		int size;
-		uint8_t udp_address[UDP_ADDRESS_SIZE];
+		int size; // tcp 情况, read 数据的大小
+		uint8_t udp_address[UDP_ADDRESS_SIZE]; // udp 情况下, 存储的是 udp 的地址信息
 	} p;
 	struct spinlock dw_lock;
 	int dw_offset;
@@ -131,21 +156,22 @@ struct socket_server {
 };
 
 struct request_open {
-	int id;
-	int port;
+	int id;		// socket id
+	int port;	// 端口
 	uintptr_t opaque;
-	char host[1];
+	char host[1];	// 主机名或者地址(IPv4的点分十进制串或者IPv6的16进制串)的字符串起始地址
 };
 
 struct request_send {
-	int id;
-	size_t sz;
-	const void * buffer;
+	int id;		// socket id
+	size_t sz;	// 发送数据大小
+	const void * buffer;	// 发送数据地址
 };
 
+/// 基于 udp 协议发送数据
 struct request_send_udp {
 	struct request_send send;
-	uint8_t address[UDP_ADDRESS_SIZE];
+	uint8_t address[UDP_ADDRESS_SIZE];		// udp 的地址信息
 };
 
 struct request_setudp {
@@ -153,6 +179,7 @@ struct request_setudp {
 	uint8_t address[UDP_ADDRESS_SIZE];
 };
 
+/// 关闭 socket
 struct request_close {
 	int id;
 	int shutdown;
@@ -177,10 +204,11 @@ struct request_resumepause {
 	uintptr_t opaque;
 };
 
+/// 基于 IPPROTO_TCP level, 设置 socket 的选项
 struct request_setopt {
 	int id;
-	int what;
-	int value;
+	int what; // 设置的选项 setsockopt(s->fd, IPPROTO_TCP, request->what, &v, sizeof(v));
+	int value; // 选项值
 };
 
 struct request_udp {
@@ -216,10 +244,11 @@ struct request_dial_udp {
 	U Create UDP socket
  */
 
+// 这里也是一个很屌的处理, 每个 request_package 变量, 所占的内存空间是连续的 8 + 256 + 256 = 520 字节大小
 struct request_package {
-	uint8_t header[8];	// 6 bytes dummy
+	uint8_t header[8];	// 6 bytes dummy 前 6 个字节没有使用 , header[6] 存request的type, header[7] 存request的len
 	union {
-		char buffer[256];
+		char buffer[256]; // 这个 buffer 其实不会直接使用, 为的是保证分配的内存空间足够 256 大小
 		struct request_open open;
 		struct request_send send;
 		struct request_send_udp send_udp;
@@ -232,12 +261,19 @@ struct request_package {
 		struct request_setudp set_udp;
 		struct request_dial_udp dial_udp;
 	} u;
-	uint8_t dummy[256];
+	uint8_t dummy[256]; // 这是一个虚拟的内存空间, 预留使用, 例如: 可以给 request_open.host 用来存储字符串
 };
 
+// 是一个方便 sockaddr 操作的整合功能, 因为内部的成员是共享内存空间的
 union sockaddr_all {
+	// 用于存储参与（IP）套接字通信的计算机上的一个internet协议（IP）地址。
+	// 为了统一地址结构的表示方法 ，统一接口函数，使得不同的地址结构可以被bind()、connect()、recvfrom()、sendto()等函数调用。
+	// 但一般的编程中并不直接对此数据结构进行操作，而使用另一个与之等价的数据结构sockaddr_in, 两者大小都是16字节，所以二者之间可以进行切换。
 	struct sockaddr s;
+	// 此数据结构用做bind、connect、recvfrom、sendto等函数的参数，指明地址信息。
+	// 但一般编程中并不直接针对此数据结构操作，而是使用另一个与sockaddr等价的数据结构.
 	struct sockaddr_in v4;
+	// 同上, 但是是 ipv6 的协议.
 	struct sockaddr_in6 v6;
 };
 
@@ -1284,13 +1320,14 @@ block_readpipe(int pipefd, void *buffer, int sz) {
 	}
 }
 
+/// 判断 ss->recvctrl_fd 是否有数据可读, 有数据可读返回 1, 否则返回 0.
 static int
 has_cmd(struct socket_server *ss) {
-	struct timeval tv = {0,0};
+	struct timeval tv = {0,0}; // 不等待, 立即返回
 	int retval;
 
-	FD_SET(ss->recvctrl_fd, &ss->rfds);
-
+	FD_SET(ss->recvctrl_fd, &ss->rfds);// 添加到描述符集里面
+	// 侦测是否可读
 	retval = select(ss->recvctrl_fd+1, &ss->rfds, NULL, NULL, &tv);
 	if (retval == 1) {
 		return 1;
@@ -1818,11 +1855,14 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 	}
 }
 
+// 将 type 和 len 数据写入到管道中
 static void
 send_request(struct socket_server *ss, struct request_package *request, char type, int len) {
 	request->header[6] = (uint8_t)type;
 	request->header[7] = (uint8_t)len;
 	const char * req = (const char *)request + offsetof(struct request_package, header[6]);
+	
+	// 必须保证数据写入
 	for (;;) {
 		ssize_t n = write(ss->sendctrl_fd, req, len+2);
 		if (n<0) {
@@ -1831,11 +1871,14 @@ send_request(struct socket_server *ss, struct request_package *request, char typ
 			}
 			continue;
 		}
+		// 保证数据完全写入
 		assert(n == len+2);
 		return;
 	}
 }
 
+/// 初始化一个 request_open, 数据赋值给 req.u.open
+/// 返回值, 成功返回主机地址的(addr)的字符串长度, 失败返回 -1
 static int
 open_request(struct socket_server *ss, struct request_package *req, uintptr_t opaque, const char *addr, int port) {
 	int len = strlen(addr);
@@ -1849,6 +1892,9 @@ open_request(struct socket_server *ss, struct request_package *req, uintptr_t op
 	req->u.open.opaque = opaque;
 	req->u.open.id = id;
 	req->u.open.port = port;
+	// 因为 request_package 分配的内存空间足够大, 所以这样处理是没有问题的, 尽管 open.host 表示的是 1 个大小的 char 数组,
+	// 但是 request_package 为 u.open.host 预留了足够的连续内存空间, 所以可以直接 memcpy 而不用担心内存覆盖问题. 
+	// 其实也就是把 addr 的数据放入到 request_package 的内存空间中.
 	memcpy(req->u.open.host, addr, len);
 	req->u.open.host[len] = '\0';
 

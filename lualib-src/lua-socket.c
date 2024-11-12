@@ -20,28 +20,42 @@
 #include "skynet.h"
 #include "skynet_socket.h"
 
-#define BACKLOG 32
+#define BACKLOG 32	// 默认的 listen 的 backlog 参数
 // 2 ** 12 == 4096
-#define LARGE_PAGE_NODE 12
+#define LARGE_PAGE_NODE 12		// 决定分配缓存数据块的最大数量, 2 的次方
 #define POOL_SIZE_WARNING 32
 #define BUFFER_LIMIT (256 * 1024)
 
+// 缓存节点, buffer_node 是不会被删除掉的, 除非所在的 lua 虚拟机 close 了, 这时 buffer_node 的内存资源才会被回收.
+// 在使用过程中, 都是对 msg 指向的内容做操作.
 struct buffer_node {
-	char * msg;
-	int sz;
-	struct buffer_node *next;
+	char * msg;	// 数据指针
+	int sz;	// 数据大小
+	struct buffer_node *next;	// 关联的下一个节点
 };
 
+/// socket 数据缓存, 队列数据结构, 这里保存的 buffer_node 都是引用可用数据的
 struct socket_buffer {
-	int size;
-	int offset;
-	struct buffer_node *head;
-	struct buffer_node *tail;
+	int size;		// 当前链表存储数据的总大小
+	int offset;		// 当前正在读取的 buffer_node 的指针偏移量, 因为可能存在当前的 buffer_node 的数据只读取了部分的情况, 所以需要记录已经被读取的内容
+	struct buffer_node *head;	// 指向队列头元素的指针
+	struct buffer_node *tail;	// 指向队列尾元素的指针
 };
 
+/**
+ * 函数作用: 释放一组 buffer_node 资源.
+ * lua: 接收 1 个参数, 0 个返回值
+ */
 static int
 lfreepool(lua_State *L) {
+	// 获取第一个参数, userdata类型(struct buffer_node, 通过 lnewpool)分配
 	struct buffer_node * pool = lua_touserdata(L, 1);
+
+	// 返回给定索引处值的固有“长度”： 
+	// 1. 对于字符串，它指字符串的长度； 
+	// 2. 对于表；它指不触发元方法的情况下取长度操作（'#'）应得到的值；
+	// 3. 对于用户数据，它指为该用户数据分配的内存块的大小；
+	// 4. 对于其它值，它为 0。
 	int sz = lua_rawlen(L,1) / sizeof(*pool);
 	int i;
 	for (i=0;i<sz;i++) {
@@ -54,24 +68,35 @@ lfreepool(lua_State *L) {
 	return 0;
 }
 
+// 分配一组 buffer_node 资源
 static int
 lnewpool(lua_State *L, int sz) {
+	// 分配内存资源, 栈顶元素是 userdata 类型
 	struct buffer_node * pool = lua_newuserdatauv(L, sizeof(struct buffer_node) * sz, 0);
 	int i;
+	// 初始化数据内容
 	for (i=0;i<sz;i++) {
 		pool[i].msg = NULL;
 		pool[i].sz = 0;
 		pool[i].next = &pool[i+1];
 	}
+	// luaL_newmetatable 这时栈顶是一个 table 类型
 	pool[sz-1].next = NULL;
 	if (luaL_newmetatable(L, "buffer_pool")) {
+		// 第一次创建, 设置 gc 函数
+		// 给栈顶的表的 __gc 字段关联 lfreepool 函数, 给分配的 userdata 添加终结器, 执行释放内存前的一些操作.
 		lua_pushcfunction(L, lfreepool);
 		lua_setfield(L, -2, "__gc");
 	}
+	// 将栈顶的表, 设置为 userdata 的原表
 	lua_setmetatable(L, -2);
 	return 1;
 }
 
+/**
+ * 创建一个 socket_buffer, 压入栈
+ * lua: 接收 0 个参数, 1 个返回值
+ */
 static int
 lnewbuffer(lua_State *L) {
 	struct socket_buffer * sb = lua_newuserdatauv(L, sizeof(*sb), 0);
@@ -99,46 +124,88 @@ lnewbuffer(lua_State *L) {
 
 	lpushbbuffer will get a free struct buffer_node from table pool, and then put the msg/size in it.
 	lpopbuffer return the struct buffer_node back to table pool (By calling return_free_node).
+	------------------------------------------------------------------------------------
+
+	接收 4 个参数
+	userdata socket_buffer
+	table pool
+	lightuserdata msg
+	int size
+
+	1 个返回值, 返回 socket_buffer 的 size
+	return size
+
+	注释: pool 表记录所有的缓存数据块, pool 表的第一个索引 [1] 是一个 lightuserdata 类型: free_node. 我们可以一直将这个指针作为 struct buffer_node 指针使用.
+	接下来的索引(从 [2] 开始)是 userdata 类型, 它是一个缓存数据块(适用于 struct buffer_node), 我们从来不会释放它们, 直到 VM 被关闭. 第一个数据块([2])的大小
+	是 16 个 struct buffer_node, 接着的第二个大小是 32 个, 以此类推. 最大的数据块大小是 LARGE_PAGE_NODE(4096) 个.
+
+	其实 pool[1] 是一个 buffer_node 链表(栈的数据结构), 得到的是当前可用的 buffer_node.
+	push 函数是将 buffer_node 从 pool[1] 中弹出到 socket_buffer 中;
+	pop 函数是将 buffer_node 从 socket_buffer 弹出, 同时释放 buffer_node.msg 的数据资源, 再添加到 pool[1] 中, 让这个 buffer_node 又可以再次使用.
+
+	lpushbuffer 将从 pool 表中获得一个空闲的 struct buffer_node, 然后设置 msg/size 的值.
+	lpopbuffer 返回一个 struct buffer_node 给 pool 表(通过调用 retune_free_node 函数).
+
+	从 pool[1] 中拿出未使用的数据 buffer_node, 使用 buffer_node 存储传入的值, 将已经记录数据的 buffer_node 添加到 socket_buffer 队列中.
+	简易流程: data = pool[1] ====>>>> pool[1] = data.next ====>>>> socket_buffer.push(data)
  */
 static int
 lpushbuffer(lua_State *L) {
+	// 获取第 1 个参数, userdata: socket_buffer
 	struct socket_buffer *sb = lua_touserdata(L,1);
 	if (sb == NULL) {
 		return luaL_error(L, "need buffer object at param 1");
 	}
+
+	// 获取第 3 个参数, lightuserdata msg
 	char * msg = lua_touserdata(L,3);
 	if (msg == NULL) {
 		return luaL_error(L, "need message block at param 3");
 	}
+
+	// 获取第 2 个参数, table pool
 	int pool_index = 2;
 	luaL_checktype(L,pool_index,LUA_TTABLE);
+
+	// 获取第 4 个参数, int size
 	int sz = luaL_checkinteger(L,4);
+
+	// 拿到 table pool 的第 1 个元素 free_node
 	lua_rawgeti(L,pool_index,1);
 	struct buffer_node * free_node = lua_touserdata(L,-1);	// sb poolt msg size free_node
 	lua_pop(L,1);
+
+	// 当没有可用的 buffer_node 时, 分配新的内存空间
 	if (free_node == NULL) {
 		int tsz = lua_rawlen(L,pool_index);
 		if (tsz == 0)
 			tsz++;
+
+		// 决定分配
 		int size = 8;
 		if (tsz <= LARGE_PAGE_NODE-3) {
-			size <<= tsz;
+			size <<= tsz; // 最小分配 16
 		} else {
-			size <<= LARGE_PAGE_NODE-3;
+			size <<= LARGE_PAGE_NODE-3; // 最大分配 4096
 		}
-		lnewpool(L, size);	
+		lnewpool(L, size);	// 分配内存数据压入到栈顶
 		free_node = lua_touserdata(L,-1);
+
+		// pool[tsz + 1] = 栈顶 userdata(free_node), tsz 从 1 开始计数, 所以这里就像上面注释说的, 从 [2] 开始存储连续的数据块.
 		lua_rawseti(L, pool_index, tsz+1);
 		if (tsz > POOL_SIZE_WARNING) {
 			skynet_error(NULL, "Too many socket pool (%d)", tsz);
 		}
 	}
-	lua_pushlightuserdata(L, free_node->next);	
+	lua_pushlightuserdata(L, free_node->next);	// 将当前 free_node 的下一个节点作为 pool[1] 的元素
 	lua_rawseti(L, pool_index, 1);	// sb poolt msg size
+	
+	// 当前的 free_node 记录数据
 	free_node->msg = msg;
 	free_node->sz = sz;
 	free_node->next = NULL;
 
+	// 将 free_node 加入到 socket_buffer
 	if (sb->head == NULL) {
 		assert(sb->tail == NULL);
 		sb->head = sb->tail = free_node;
@@ -148,7 +215,7 @@ lpushbuffer(lua_State *L) {
 	}
 	sb->size += sz;
 
-	lua_pushinteger(L, sb->size);
+	lua_pushinteger(L, sb->size); // 压入 sb->size 作为返回值
 
 	return 1;
 }
@@ -482,6 +549,10 @@ lshutdown(lua_State *L) {
 	return 0;
 }
 
+/**
+ * 侦听指定的端口地址
+ * lua: 接收 3 个参数, 参数 1, 主机地址; 参数 2, 端口; 参数 3, backlog, 如果不传此参数, 将使用默认值; 1 个返回值, socket id
+ */
 static int
 llisten(lua_State *L) {
 	const char * host = luaL_checkstring(L,1);
@@ -578,6 +649,11 @@ get_buffer(lua_State *L, int index, struct socket_sendbuffer *buf) {
 	}
 }
 
+/**
+ * 使用高优先级队列发送数据
+ * lua: 接收 2 或者 3 个参数, 参数 1, socket id; 参数 2, 如果是 string, 那么无需传入参数 3, 如果是 lightuserdata 那么需要参数 3, 表示数据的大小.
+ * 1 个返回值, boolean 类型, true 表示成功.
+ */
 static int
 lsend(lua_State *L) {
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
@@ -590,6 +666,11 @@ lsend(lua_State *L) {
 	return 1;
 }
 
+/**
+ * 使用低优先级队列发送数据
+ * lua: 接收 2 或者 3 个参数, 参数 1, socket id; 参数 2, 如果是 string, 那么无需传入参数 3, 如果是 lightuserdata 那么需要参数 3, 表示数据的大小.
+ * 0 个返回值.
+ */
 static int
 lsendlow(lua_State *L) {
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
@@ -855,8 +936,11 @@ lresolve(lua_State *L) {
 	return 1;
 }
 
+/// 注册 socket 模块到 lua 中
 LUAMOD_API int
 luaopen_skynet_socketdriver(lua_State *L) {
+	// 检查调用它的内核是否是创建这个 Lua 状态机的内核。 以及调用它的代码是否使用了相同的 Lua 版本。 
+	// 同时也检查调用它的内核与创建该 Lua 状态机的内核 是否使用了同一片地址空间。
 	luaL_checkversion(L);
 	luaL_Reg l[] = {
 		{ "buffer", lnewbuffer },
@@ -873,7 +957,8 @@ luaopen_skynet_socketdriver(lua_State *L) {
 		{ "unpack", lunpack },
 		{ NULL, NULL },
 	};
-	luaL_newlib(L,l);
+	luaL_newlib(L,l); // 创建一张新的表，并把列表 l 中的函数注册进去。  这时栈顶是 table
+
 	luaL_Reg l2[] = {
 		{ "connect", lconnect },
 		{ "close", lclose },
@@ -894,12 +979,16 @@ luaopen_skynet_socketdriver(lua_State *L) {
 		{ "resolve", lresolve },
 		{ NULL, NULL },
 	};
+	// 将注册表的 "skynet_context" 的值压入到栈顶, 在 service_snlua.c 的 _init 函数中在注册表中添加了 "skynet_context" 这个域的值.
 	lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
 	struct skynet_context *ctx = lua_touserdata(L,-1);
 	if (ctx == NULL) {
 		return luaL_error(L, "Init skynet context first");
 	}
-
+	// void luaL_setfuncs (lua_State *L, const luaL_Reg *l, int nup);
+	// 把数组 l 中的所有函数注册到栈顶的表中(该表在可选的 upvalue 之下, 见下面的解说).
+	// 若 nup 不为零， 所有的函数都共享 nup 个 upvalue。 这些值必须在调用之前，压在表之上。 这些值在注册完毕后都会从栈弹出。
+	// 根据上面对 luaL_setfuncs 的描述, 当前共享的 upvalue 就是 userdata(skynet_context).
 	luaL_setfuncs(L,l2,1);
 
 	return 1;
